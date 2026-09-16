@@ -678,9 +678,9 @@ fun BottomSheetPlayer(
                         steps = (120 - 5) / 5 - 1,
                     )
 
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
                         if (isAtDefault) {
                             FilledIconButton(
@@ -969,7 +969,8 @@ fun BottomSheetPlayer(
                                         contentDescription = null,
                                         modifier =
                                             Modifier
-                                                .size(32.dp)
+                                                .size(32.dp),
+                                        tint = textButtonColor.copy(alpha = 0.7f),
                                     )
                                 }
                             } else {
@@ -1721,7 +1722,9 @@ fun BottomSheetPlayer(
                                             .size(32.dp)
                                             .padding(4.dp)
                                             .align(Alignment.Center)
-                                            .alpha(if (isListenTogetherGuest) 0.5f else 1f),
+                                            .alpha(
+                                                if (isListenTogetherGuest || repeatMode == Player.REPEAT_MODE_OFF) 0.5f else 1f,
+                                            ),
                                     enabled = !isListenTogetherGuest,
                                     onClick = {
                                         playerConnection.player.toggleRepeatMode()
@@ -2126,48 +2129,6 @@ fun InlineLyricsView(
                 }
             }
         }
-    }
-}
-
-@Composable
-fun MoreActionsButton(
-    mediaMetadata: MediaMetadata,
-    navController: NavController,
-    state: BottomSheetState,
-    textButtonColor: Color,
-    iconButtonColor: Color,
-) {
-    val menuState = LocalMenuState.current
-    val bottomSheetPageState = LocalBottomSheetPageState.current
-
-    Box(
-        modifier =
-            Modifier
-                .size(40.dp)
-                .clip(RoundedCornerShape(24.dp))
-                .background(textButtonColor)
-                .clickable {
-                    menuState.show {
-                        PlayerMenu(
-                            mediaMetadata = mediaMetadata,
-                            playerBottomSheetState = state,
-                            onShowDetailsDialog = {
-                                mediaMetadata.id.let {
-                                    bottomSheetPageState.show {
-                                        ShowMediaInfo(it)
-                                    }
-                                }
-                            },
-                            onDismiss = menuState::dismiss,
-                        )
-                    }
-                },
-    ) {
-        Image(
-            painter = painterResource(R.drawable.more_horiz),
-            contentDescription = null,
-            colorFilter = ColorFilter.tint(iconButtonColor),
-        )
     }
 }
 

@@ -18,7 +18,8 @@ import android.os.Bundle
 import android.os.IBinder
 import android.view.View
 import android.view.WindowManager
-import androidx.activity.ComponentActivity
+import android.widget.Toast
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateDpAsState
@@ -41,13 +42,17 @@ import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AlertDialogDefaults
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
@@ -61,6 +66,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.contentColorFor
@@ -132,6 +138,9 @@ import com.metrolist.music.constants.AppLanguageKey
 import com.metrolist.music.constants.CheckForUpdatesKey
 import com.metrolist.music.constants.DarkModeKey
 import com.metrolist.music.constants.DefaultOpenTabKey
+import com.metrolist.music.constants.DismissedKmpUpdateKey
+import com.metrolist.music.constants.DismissedStandaloneUpdateKey
+import com.metrolist.music.constants.DensityScaleKey
 import com.metrolist.music.constants.DisableScreenshotKey
 import com.metrolist.music.constants.DynamicThemeKey
 import com.metrolist.music.constants.EnableHighRefreshRateKey
@@ -161,6 +170,7 @@ import com.metrolist.music.constants.SlimNavBarHeight
 import com.metrolist.music.constants.SlimNavBarKey
 import com.metrolist.music.constants.UpdateNotificationsEnabledKey
 import com.metrolist.music.constants.UseNewMiniPlayerDesignKey
+import com.metrolist.music.constants.VideoThumbnailMigrationDoneKey
 import com.metrolist.music.db.MusicDatabase
 import com.metrolist.music.db.entities.SearchHistory
 import com.metrolist.music.extensions.toEnum
@@ -193,8 +203,10 @@ import com.metrolist.music.ui.theme.MetrolistTheme
 import com.metrolist.music.ui.theme.extractThemeColor
 import com.metrolist.music.ui.utils.appBarScrollBehavior
 import com.metrolist.music.ui.utils.resetHeightOffset
+import com.metrolist.music.utils.ReleaseInfo
 import com.metrolist.music.utils.SearchRoutes
 import com.metrolist.music.utils.SyncUtils
+import com.metrolist.music.utils.ArtistNameAliases
 import com.metrolist.music.utils.Updater
 import com.metrolist.music.utils.dataStore
 import com.metrolist.music.utils.safeDataStoreEdit
@@ -218,9 +230,17 @@ import timber.log.Timber
 import java.util.Locale
 import javax.inject.Inject
 
+private data class AvailableUpdate(
+    val release: ReleaseInfo,
+    val downloadUrl: String,
+    val isKmp: Boolean,
+) {
+    val dismissalKey = if (isKmp) DismissedKmpUpdateKey else DismissedStandaloneUpdateKey
+}
+
 @Suppress("DEPRECATION", "ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
 @AndroidEntryPoint
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     companion object {
         private const val ACTION_SEARCH = "com.metrolist.music.action.SEARCH"
         private const val ACTION_LIBRARY = "com.metrolist.music.action.LIBRARY"
@@ -245,7 +265,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var navController: NavHostController
     private var pendingIntent: Intent? = null
-    private var latestVersionName by mutableStateOf(BuildConfig.VERSION_NAME)
+    private var latestVersionName by mutableStateOf(BuildConfig.BASE_VERSION_NAME)
 
     // Keep PlayerConnection as regular property - NOT mutableStateOf to prevent UI recomposition
     // when it becomes null during onStop. Only update the snapshot for Compose when needed.
@@ -410,7 +430,7 @@ class MainActivity : ComponentActivity() {
         // Defer migration and version tracking to avoid blocking first frame
         lifecycleScope.launch(Dispatchers.IO) {
             val preferences = dataStore.data.first()
-            val currentVersion = BuildConfig.VERSION_NAME
+            val currentVersion = BuildConfig.BASE_VERSION_NAME
 
             // SimpMusic Removal Migration
             if (preferences[SimpMusicMigrationDoneKey] != true) {
@@ -453,11 +473,19 @@ class MainActivity : ComponentActivity() {
                     settings[PauseAutoStopMigrationDoneKey] = true
                 }
             }
+
+            // Video Thumbnail Repair Migration (upstream)
+            if (preferences[VideoThumbnailMigrationDoneKey] != true) {
+                database.repairMissingVideoThumbnails()
+                safeDataStoreEdit { settings ->
+                    settings[VideoThumbnailMigrationDoneKey] = true
+                }
+            }
         }
 
         lifecycleScope.launch(Dispatchers.IO) {
             safeDataStoreEdit { settings ->
-                settings[LastSeenVersionKey] = BuildConfig.VERSION_NAME
+                settings[LastSeenVersionKey] = BuildConfig.BASE_VERSION_NAME
             }
         }
 
@@ -485,51 +513,76 @@ class MainActivity : ComponentActivity() {
         syncUtils: SyncUtils,
     ) {
         val checkForUpdates by rememberPreference(CheckForUpdatesKey, defaultValue = true)
+        var availableUpdate by remember { mutableStateOf<AvailableUpdate?>(null) }
 
         if (BuildConfig.UPDATER_AVAILABLE) {
             LaunchedEffect(checkForUpdates) {
                 if (checkForUpdates) {
-                    withContext(Dispatchers.IO) {
-                        val updatesEnabled = dataStore.get(CheckForUpdatesKey, true)
-                        val notifEnabled = dataStore.get(UpdateNotificationsEnabledKey, true)
-                        if (!updatesEnabled) return@withContext
+                    val preferences = dataStore.data.first()
+                    val notificationsEnabled = preferences[UpdateNotificationsEnabledKey] ?: true
+                    val (releaseInfo, hasUpdate) = Updater.checkForUpdate().getOrNull() ?: (null to false)
+                    releaseInfo?.let { onLatestVersionNameChange(it.versionName) }
 
-                        Updater.checkForUpdate().onSuccess { (releaseInfo, hasUpdate) ->
-                            if (releaseInfo != null) {
-                                onLatestVersionNameChange(releaseInfo.versionName)
-                                if (hasUpdate && notifEnabled) {
-                                    val downloadUrl = Updater.getDownloadUrlForCurrentVariant(releaseInfo)
-                                    if (downloadUrl != null) {
-                                        val intent = Intent(Intent.ACTION_VIEW, downloadUrl.toUri())
-
-                                        val flags =
-                                            PendingIntent.FLAG_UPDATE_CURRENT or
-                                                (PendingIntent.FLAG_IMMUTABLE)
-                                        val pending = PendingIntent.getActivity(this@MainActivity, 1001, intent, flags)
-
-                                        val notif =
-                                            NotificationCompat
-                                                .Builder(this@MainActivity, "updates")
-                                                .setSmallIcon(R.drawable.update)
-                                                .setContentTitle(getString(R.string.update_available_title))
-                                                .setContentText(releaseInfo.versionName)
-                                                .setContentIntent(pending)
-                                                .setAutoCancel(true)
-                                                .build()
-
-                                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-                                            ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) ==
-                                            PackageManager.PERMISSION_GRANTED
-                                        ) {
-                                            NotificationManagerCompat.from(this@MainActivity).notify(1001, notif)
-                                        }
-                                    }
+                    val standaloneUpdate =
+                        releaseInfo
+                            ?.takeIf { hasUpdate }
+                            ?.let { release ->
+                                Updater.getDownloadUrlForCurrentVariant(release)?.let { downloadUrl ->
+                                    AvailableUpdate(release, downloadUrl, isKmp = false)
                                 }
                             }
+                    val kmpUpdate =
+                        Updater.getLatestKmpRelease().getOrNull()?.let { release ->
+                            release.assets.firstOrNull()?.let { asset ->
+                                AvailableUpdate(release, asset.downloadUrl, isKmp = true)
+                            }
+                        }
+                    val update = kmpUpdate ?: standaloneUpdate
+                    availableUpdate = update?.takeUnless {
+                        it.release.tagName == preferences[it.dismissalKey]
+                    }
+
+                    if (update != null && notificationsEnabled) {
+                        val intent = Intent(Intent.ACTION_VIEW, update.downloadUrl.toUri())
+                        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                        val pending = PendingIntent.getActivity(this@MainActivity, 1001, intent, flags)
+                        val notificationText =
+                            if (update.isKmp) {
+                                getString(R.string.kmp_upgrade_warning)
+                            } else {
+                                update.release.versionName
+                            }
+                        val notification =
+                            NotificationCompat
+                                .Builder(this@MainActivity, "updates")
+                                .setSmallIcon(R.drawable.update)
+                                .setContentTitle(
+                                    if (update.isKmp) {
+                                        getString(R.string.kmp_upgrade_title, update.release.versionName)
+                                    } else {
+                                        getString(R.string.update_available_title)
+                                    },
+                                )
+                                .setContentText(notificationText)
+                                .apply {
+                                    if (update.isKmp) {
+                                        setStyle(NotificationCompat.BigTextStyle().bigText(notificationText))
+                                    }
+                                }
+                                .setContentIntent(pending)
+                                .setAutoCancel(true)
+                                .build()
+
+                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                            ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) ==
+                            PackageManager.PERMISSION_GRANTED
+                        ) {
+                            NotificationManagerCompat.from(this@MainActivity).notify(1001, notification)
                         }
                     }
                 } else {
-                    onLatestVersionNameChange(BuildConfig.VERSION_NAME)
+                    onLatestVersionNameChange(BuildConfig.BASE_VERSION_NAME)
+                    availableUpdate = null
                 }
             }
         }
@@ -577,6 +630,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val enableLandscapeScaling by rememberPreference(EnableLandscapeScalingKey, defaultValue = false)
+        val userDensityScale by rememberPreference(DensityScaleKey, defaultValue = 1f)
         val pureBlackEnabled by rememberPreference(PureBlackKey, defaultValue = false)
         val pureBlack =
             remember(pureBlackEnabled, useDarkTheme) {
@@ -656,21 +710,22 @@ class MainActivity : ComponentActivity() {
             val containerSize = windowInfo.containerDpSize
             val smallestDimensionDp = minOf(containerSize.width, containerSize.height)
 
-            val densityScale = remember(smallestDimensionDp, enableLandscapeScaling) {
-                if (enableLandscapeScaling) {
-                    when {
-                        smallestDimensionDp >= 840.dp -> 1.15f
-                        smallestDimensionDp >= 720.dp -> 1.1f
-                        smallestDimensionDp >= 600.dp -> 1.05f
-                        else -> 1.0f
+            val landscapeDensityScale =
+                remember(smallestDimensionDp, enableLandscapeScaling) {
+                    if (enableLandscapeScaling) {
+                        when {
+                            smallestDimensionDp >= 840.dp -> 1.15f
+                            smallestDimensionDp >= 720.dp -> 1.1f
+                            smallestDimensionDp >= 600.dp -> 1.05f
+                            else -> 1.0f
+                        }
+                    } else {
+                        1.0f
                     }
-                } else {
-                    1.0f
                 }
-            }
-            val scaledDensity: Density = remember(currentDensity, densityScale) {
+            val scaledDensity: Density = remember(currentDensity, landscapeDensityScale, userDensityScale) {
                 Density(
-                    density = currentDensity.density * densityScale,
+                    density = currentDensity.density * landscapeDensityScale * userDensityScale,
                     fontScale = currentDensity.fontScale,
                 )
             }
@@ -693,7 +748,7 @@ class MainActivity : ComponentActivity() {
 
                 LaunchedEffect(Unit) {
                     val lastSeenVersion = dataStore.data.first()[LastSeenVersionKey] ?: ""
-                    val currentVersion = BuildConfig.VERSION_NAME
+                    val currentVersion = BuildConfig.BASE_VERSION_NAME
                     if (lastSeenVersion != currentVersion) {
                         showChangelog.value = true
                     }
@@ -729,8 +784,8 @@ class MainActivity : ComponentActivity() {
                 val tabOpenedFromShortcut =
                     remember {
                         when (intent?.action) {
-                            ACTION_SEARCH -> NavigationTab.LIBRARY
-                            ACTION_LIBRARY -> NavigationTab.SEARCH
+                            ACTION_SEARCH -> NavigationTab.SEARCH
+                            ACTION_LIBRARY -> NavigationTab.LIBRARY
                             else -> null
                         }
                     }
@@ -996,6 +1051,7 @@ class MainActivity : ComponentActivity() {
                     }
 
                 val baseBg = if (pureBlack) Color.Black else MaterialTheme.colorScheme.surfaceContainer
+                val artistNameAliases by ArtistNameAliases.aliases.collectAsStateWithLifecycle()
 
                 CompositionLocalProvider(
                     LocalDatabase provides database,
@@ -1008,6 +1064,7 @@ class MainActivity : ComponentActivity() {
                     LocalSyncUtils provides syncUtils,
                     LocalListenTogetherManager provides listenTogetherManager,
                     LocalChangelogState provides showChangelog,
+                    LocalArtistNameAliases provides artistNameAliases,
                 ) {
                     if (showChangelog.value) {
                         ChangelogScreen(onDismiss = { showChangelog.value = false })
@@ -1054,7 +1111,7 @@ class MainActivity : ComponentActivity() {
                                             }
                                             IconButton(onClick = { showAccountDialog = true }) {
                                                 BadgedBox(badge = {
-                                                    if (latestVersionName != BuildConfig.VERSION_NAME) {
+                                                    if (latestVersionName != BuildConfig.BASE_VERSION_NAME) {
                                                         Badge()
                                                     }
                                                 }) {
@@ -1181,6 +1238,7 @@ class MainActivity : ComponentActivity() {
                                         pureBlack = pureBlack,
                                         slimNav = slimNav,
                                         onSearchLongClick = onSearchLongClick,
+                                        onHomeLongHold = { showAccountDialog = true },
                                         modifier =
                                             Modifier
                                                 .align(Alignment.BottomCenter)
@@ -1297,6 +1355,7 @@ class MainActivity : ComponentActivity() {
                                     onItemClick = onRailItemClick,
                                     pureBlack = pureBlack,
                                     onSearchLongClick = onRailSearchLongClick,
+                                    onHomeLongHold = { showAccountDialog = true },
                                 )
                             }
                             Box(Modifier.weight(1f)) {
@@ -1306,8 +1365,8 @@ class MainActivity : ComponentActivity() {
                                     startDestination =
                                         when (tabOpenedFromShortcut ?: defaultOpenTab) {
                                             NavigationTab.HOME -> Screens.Home
+                                            NavigationTab.SEARCH -> Screens.Search
                                             NavigationTab.LIBRARY -> Screens.Library
-                                            else -> Screens.Home
                                         }.route,
                                     enterTransition = {
                                         val currentRouteIndex = routeIndexMap[targetState.destination.route] ?: -1
@@ -1407,6 +1466,80 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
+
+                    if (!showChangelog.value) {
+                        availableUpdate?.let { update ->
+                            val dismissUpdate: () -> Unit = {
+                                availableUpdate = null
+                                lifecycleScope.launch {
+                                    safeDataStoreEdit {
+                                        it[update.dismissalKey] = update.release.tagName
+                                    }
+                                }
+                            }
+                            AlertDialog(
+                                onDismissRequest = dismissUpdate,
+                                title = { Text(stringResource(R.string.update_available_title)) },
+                                text = {
+                                    Column(
+                                        modifier =
+                                            Modifier
+                                                .heightIn(max = 480.dp)
+                                                .verticalScroll(rememberScrollState()),
+                                    ) {
+                                        Text(
+                                            text =
+                                                stringResource(
+                                                    if (update.isKmp) {
+                                                        R.string.kmp_upgrade_title
+                                                    } else {
+                                                        R.string.update_available_message
+                                                    },
+                                                    update.release.versionName,
+                                                ),
+                                            style = MaterialTheme.typography.bodyMedium,
+                                        )
+                                        if (update.isKmp) {
+                                            Text(
+                                                text = stringResource(R.string.kmp_upgrade_warning),
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = MaterialTheme.colorScheme.error,
+                                                modifier = Modifier.padding(top = 12.dp),
+                                            )
+                                        }
+                                        Text(
+                                            text = stringResource(R.string.changelog),
+                                            style = MaterialTheme.typography.titleSmall,
+                                            modifier = Modifier.padding(top = 16.dp, bottom = 8.dp),
+                                        )
+                                        Text(
+                                            text = update.release.description.ifBlank { stringResource(R.string.changelog_empty) },
+                                            style = MaterialTheme.typography.bodySmall,
+                                        )
+                                    }
+                                },
+                                confirmButton = {
+                                    TextButton(
+                                        onClick = {
+                                            dismissUpdate()
+                                            startActivity(Intent(Intent.ACTION_VIEW, update.downloadUrl.toUri()))
+                                        },
+                                    ) {
+                                        Text(
+                                            stringResource(
+                                                if (update.isKmp) R.string.kmp_upgrade_action else R.string.update_action,
+                                            ),
+                                        )
+                                    }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = dismissUpdate) {
+                                        Text(stringResource(R.string.kmp_upgrade_later))
+                                    }
+                                },
+                            )
+                        }
+                    }
                 }
             }
             }
@@ -1496,22 +1629,26 @@ class MainActivity : ComponentActivity() {
 
         when (val path = uri.pathSegments.firstOrNull()) {
             "playlist" -> {
-                uri.getQueryParameter("list")?.let { playlistId ->
-                    if (playlistId.startsWith("OLAK5uy_")) {
-                        coroutineScope.launch(Dispatchers.IO) {
-                            YouTube
-                                .albumSongs(playlistId)
-                                .onSuccess { songs ->
-                                    songs.firstOrNull()?.album?.id?.let { browseId ->
-                                        withContext(Dispatchers.Main) {
-                                            navController.navigate("album/$browseId")
-                                        }
+                val playlistId = uri.getQueryParameter("list")
+                if (playlistId.isNullOrBlank() || playlistId.equals("null", ignoreCase = true)) {
+                    Toast.makeText(this, R.string.playlist_unavailable, Toast.LENGTH_SHORT).show()
+                    return
+                }
+
+                if (playlistId.startsWith("OLAK5uy_")) {
+                    coroutineScope.launch(Dispatchers.IO) {
+                        YouTube
+                            .albumSongs(playlistId)
+                            .onSuccess { songs ->
+                                songs.firstOrNull()?.album?.id?.let { browseId ->
+                                    withContext(Dispatchers.Main) {
+                                        navController.navigate("album/$browseId")
                                     }
-                                }.onFailure { reportException(it) }
-                        }
-                    } else {
-                        navController.navigate("online_playlist/$playlistId")
+                                }
+                            }.onFailure { reportException(it) }
                     }
+                } else {
+                    navController.navigate("online_playlist/$playlistId")
                 }
             }
 
@@ -1606,4 +1743,5 @@ val LocalDownloadUtil = staticCompositionLocalOf<DownloadUtil> { error("No Downl
 val LocalSyncUtils = staticCompositionLocalOf<SyncUtils> { error("No SyncUtils provided") }
 val LocalListenTogetherManager = staticCompositionLocalOf<com.metrolist.music.listentogether.ListenTogetherManager?> { null }
 val LocalChangelogState = staticCompositionLocalOf<MutableState<Boolean>> { error("No LocalChangelogState provided") }
+val LocalArtistNameAliases = staticCompositionLocalOf<Map<String, String>> { emptyMap() }
 val LocalIsPlayerExpanded = compositionLocalOf { false }
